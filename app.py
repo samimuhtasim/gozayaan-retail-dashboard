@@ -43,12 +43,9 @@ DATA_DIR = BASE_DIR / "data"
 SNAPSHOT_DASH = DATA_DIR / "Dashboard (1).xlsx"
 SNAPSHOT_CSS = DATA_DIR / "CSS Helper (1).xlsx"
 
-PUBLISHED_URL = os.getenv(
-    "GOZAAYAN_PUBLISHED_URL",
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vTv8b75NS5qseGpuVvNHvCckH7luGvMhbMS_fSB8f3rf6VOvPKt7_5n9rzcvFWBrfozh66N06_cFHIU/pubhtml",
-).strip()
-
+PUBLISHED_URL = os.getenv("GOZAAYAN_PUBLISHED_URL", "").strip()
 GID_MAP_ENV = os.getenv("GOZAAYAN_GID_MAP", "").strip()
+LIVE_REQUIRED = bool(PUBLISHED_URL)
 
 REFRESH_MINUTES = int(os.getenv("GOZAAYAN_REFRESH_MINUTES", "30"))
 SNAPSHOT_HOUR = int(os.getenv("GOZAAYAN_SNAPSHOT_HOUR", "23"))
@@ -349,7 +346,7 @@ class SourceManager:
 
     def refresh(self):
         with self.lock:
-            if PUBLISHED_URL:
+            if LIVE_REQUIRED:
                 try:
                     live = PublishedSource(PUBLISHED_URL)
                     for tab in self.REQUIRED_TABS:
@@ -360,18 +357,25 @@ class SourceManager:
                     self.last_refresh = datetime.now()
                     return
                 except Exception as exc:
+                    # In live mode, do NOT fall back to snapshots.
+                    # A public dashboard must never silently show stale data.
+                    self.source = None
+                    self.source_name = "LIVE GOOGLE SHEET UNAVAILABLE"
                     self.last_error = str(exc)
+                    self.last_refresh = None
+                    return
 
             if not SNAPSHOT_DASH.exists() or not SNAPSHOT_CSS.exists():
                 raise RuntimeError(
-                    "Live Google Sheet could not be loaded and bundled snapshots are missing."
+                    "No live Google Sheet URL configured and bundled snapshots are missing."
                 )
 
             self.source = SnapshotSource(
                 SNAPSHOT_DASH,
                 SNAPSHOT_CSS,
             )
-            self.source_name = "BUNDLED SNAPSHOT"
+            self.source_name = "BUNDLED SNAPSHOT (LOCAL TEST MODE)"
+            self.last_error = None
             self.last_refresh = datetime.now()
 
     def tab(self, name: str) -> pd.DataFrame:
@@ -397,7 +401,16 @@ def target_value(df: pd.DataFrame, row_1based: int, col: str) -> float:
     return num(df.iloc[idx, col_idx(col)])
 
 
+def ensure_source_available():
+    if SOURCE.source is None:
+        raise RuntimeError(
+            SOURCE.last_error
+            or "Live Google Sheet is unavailable."
+        )
+
+
 def dashboard_h2() -> dict:
+    ensure_source_available()
     """
     The Dashboard sheet is the source of truth for the locked H2 page.
     We do not derive these values independently.
@@ -420,6 +433,7 @@ def dashboard_h2() -> dict:
 
 
 def branch_month_targets(branch: str, end: date) -> dict:
+    ensure_source_available()
     t = SOURCE.tab("Target Helper")
     row = TARGET_ROWS[branch]
 
@@ -444,6 +458,7 @@ def branch_month_targets(branch: str, end: date) -> dict:
 
 
 def branch_period(branch: str, start: date, end: date) -> dict:
+    ensure_source_available()
     cfg = BRANCH_SOURCE[branch]
 
     css = SOURCE.tab(cfg["css"])
@@ -614,6 +629,7 @@ def branch_progress(branch: str, as_of: date) -> dict:
 
 
 def h2_performance() -> list[dict]:
+    ensure_source_available()
     """
     H2 is intentionally derived from the same data families:
       Flight/Hotel = branch CSS + branch FIT
@@ -718,6 +734,7 @@ def h2_performance() -> list[dict]:
 
 
 def wbr_targets() -> dict:
+    ensure_source_available()
     t = SOURCE.tab("Target Helper")
 
     def v(row, col):
@@ -760,6 +777,7 @@ def wbr_targets() -> dict:
 
 
 def wbr_metrics(week_end: date) -> dict:
+    ensure_source_available()
     monday = week_end - timedelta(days=week_end.weekday())
     sunday = monday + timedelta(days=6)
 
@@ -999,6 +1017,7 @@ def wbr_metrics(week_end: date) -> dict:
 
 
 def wbr_narrative() -> dict:
+    ensure_source_available()
     df = SOURCE.tab("WBR Format")
 
     def rows(start, end, cols):
@@ -1338,8 +1357,11 @@ def index():
 
 @app.get("/api/health")
 def health():
+    live_ok = SOURCE.source is not None
     return {
+        "ok": live_ok,
         "source": SOURCE.source_name,
+        "live_required": LIVE_REQUIRED,
         "last_refresh": SOURCE.last_refresh.isoformat()
         if SOURCE.last_refresh else None,
         "last_error": SOURCE.last_error,

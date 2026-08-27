@@ -96,3 +96,12 @@ The v7 package was smoke-tested against the provided Dashboard and CSS Helper sn
 ## Persistence caveat
 
 The month-end snapshot feature writes files to the app filesystem. On hosting with ephemeral storage, those files can disappear on redeploy/restart. For a durable archive, point `SNAPSHOT_DIR` at persistent storage or add object storage later. The capture logic itself is ready.
+
+
+## v7.1 fixes
+
+- Removed duplicate refresh-button rendering.
+- Live Google Sheet mode is now strict: if `GOZAAYAN_PUBLISHED_URL` is set and the live source cannot be read, the app does NOT fall back to XLSX snapshots.
+- `/api/health` now returns `ok: false` and the source error in live failure mode.
+- The frontend shows an explicit LIVE SOURCE UNAVAILABLE state instead of silently showing stale snapshot data.
+- Local development without `GOZAAYAN_PUBLISHED_URL` still uses bundled snapshots.

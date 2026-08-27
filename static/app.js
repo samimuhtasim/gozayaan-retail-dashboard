@@ -115,8 +115,8 @@ async function load(){
    render(d);
    setStatus((d.source||"Source")+" • last data refresh "+(state.lastRefresh?new Date(state.lastRefresh).toLocaleString("en-GB",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}):"unknown"));
  }catch(err){
-   root.innerHTML=`<div class="error">${esc(err.message||err)}</div>`;
-   setStatus("Data request failed","error");
+   root.innerHTML=`<div class="error"><b>Live data unavailable.</b><br>${esc(err.message||err)}<br><br>The dashboard is not showing a snapshot because live mode is enabled.</div>`;
+   setStatus("LIVE SOURCE UNAVAILABLE","error");
  }
 }
 
@@ -138,6 +138,7 @@ async function manualRefresh(){
 /* Add refresh button at the top right of every page. */
 function addRefreshButton(){
  const controls=document.getElementById("controls");
+ if(controls.querySelector(".refresh-main")) return;
  const wrap=document.createElement("div");
  wrap.className="refresh-wrap";
  wrap.innerHTML=`<button class="button primary refresh refresh-main" onclick="manualRefresh()">↻ REFRESH DATA</button><div class="refresh-caption">Automatic refresh every 30 minutes</div>`;
