@@ -1,0 +1,2 @@
+GOZAAYAN_SHEETS_API_URL=https://script.google.com/macros/s/AKfycbxzvfVm3zjo8ADZBCxE7jcSnKIaISEmRzbsIfWiIAUsiHHTDnLU6uhsYlhrfYMjVYLT/exec
+GOZAAYAN_REFRESH_MINUTES=30
