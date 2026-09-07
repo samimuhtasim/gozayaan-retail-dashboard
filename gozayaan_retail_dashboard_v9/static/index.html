@@ -1,0 +1,51 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GoZayaan Retail</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="shell">
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-name">gozayaan</div>
+    <div class="brand-sub">Retail performance</div>
+  </div>
+  <nav id="nav">
+    <button data-page="dashboard">Dashboard</button>
+    <button data-page="banani">Banani</button>
+    <button data-page="chattogram">Chattogram</button>
+    <button data-page="hq">HQ</button>
+    <button data-page="motijheel">Motijheel</button>
+    <button data-page="wbr">Weekly Business Review</button>
+  </nav>
+</aside>
+<button id="sidebarToggle" class="sidebar-toggle" aria-label="Hide navigation" title="Hide navigation">☰</button>
+<main class="main">
+  <header class="topbar">
+    <div>
+      <div id="eyebrow" class="eyebrow">Management View</div>
+      <h1 id="title">H-2 Achievement Dashboard</h1>
+      <div class="subtitle">Retail performance • USD</div>
+    </div>
+    <div id="controls" class="controls"></div>
+  </header>
+
+  <div class="action-row">
+    <div id="status" class="statusbar">
+      <span class="status-dot"></span>
+      <span id="statusText">Loading…</span>
+    </div>
+    <div id="exports" class="exports"></div>
+  </div>
+
+  <section id="view"></section>
+</main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
