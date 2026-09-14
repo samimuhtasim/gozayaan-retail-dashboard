@@ -8,13 +8,11 @@ import os
 import re
 import threading
 import time
-import tempfile
-import zipfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
@@ -43,11 +41,21 @@ DATA_DIR = BASE_DIR / "data"
 SNAPSHOT_DASH = DATA_DIR / "Dashboard (1).xlsx"
 SNAPSHOT_CSS = DATA_DIR / "CSS Helper (1).xlsx"
 
-PUBLISHED_URL = os.getenv("GOZAAYAN_PUBLISHED_URL", "").strip()
-GID_MAP_ENV = os.getenv("GOZAAYAN_GID_MAP", "").strip()
-LIVE_REQUIRED = bool(PUBLISHED_URL)
+APPS_SCRIPT_URL = os.getenv("GOZAAYAN_SHEETS_API_URL", "https://script.google.com/macros/s/AKfycbxzvfVm3zjo8ADZBCxE7jcSnKIaISEmRzbsIfWiIAUsiHHTDnLU6uhsYlhrfYMjVYLT/exec").strip()
+LIVE_REQUIRED = bool(APPS_SCRIPT_URL)
+BDT = ZoneInfo("Asia/Dhaka")
 
 REFRESH_MINUTES = int(os.getenv("GOZAAYAN_REFRESH_MINUTES", "30"))
+
+# Apps Script throttles concurrent hits to a single deployment and can
+# invalidate its redirect content key under load. Low concurrency plus a
+# retry is what keeps the refresh reliable.
+WARM_WORKERS = int(os.getenv("GOZAAYAN_WARM_WORKERS", "2"))
+FETCH_ATTEMPTS = int(os.getenv("GOZAAYAN_FETCH_ATTEMPTS", "3"))
+FETCH_BACKOFF_SECONDS = float(os.getenv("GOZAAYAN_FETCH_BACKOFF", "1.5"))
+# Set GOZAAYAN_BATCH_FETCH=1 only AFTER redeploying the Apps Script
+# with the ?sheets= handler. Falls back to per-tab fetching if it fails.
+BATCH_FETCH = os.getenv("GOZAAYAN_BATCH_FETCH", "0").strip() == "1"
 SNAPSHOT_HOUR = int(os.getenv("GOZAAYAN_SNAPSHOT_HOUR", "23"))
 SNAPSHOT_MINUTE = int(os.getenv("GOZAAYAN_SNAPSHOT_MINUTE", "55"))
 SNAPSHOT_DIR = BASE_DIR / "snapshots"
@@ -239,78 +247,151 @@ class SnapshotSource:
         return self._css_cache[sheet].copy()
 
 
-class PublishedSource:
-    def __init__(self, published_url: str):
-        self.published_url = published_url
-        self._gid_map: Optional[Dict[str, str]] = None
+class AppsScriptSource:
+    """Read live Google Sheet tabs through the deployed Apps Script JSON API."""
+
+    def __init__(self, api_url: str):
+        self.api_url = api_url.rstrip("/")
         self._cache: Dict[str, pd.DataFrame] = {}
 
-    def _discover_gids(self) -> Dict[str, str]:
-        if self._gid_map is not None:
-            return self._gid_map
+    def _fetch_once(self, name: str) -> pd.DataFrame:
+        response = requests.get(
+            self.api_url,
+            params={"sheet": name},
+            timeout=60,
+            allow_redirects=True,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
 
-        if GID_MAP_ENV:
-            data = json.loads(GID_MAP_ENV)
-            self._gid_map = {str(k): str(v) for k, v in data.items()}
-            return self._gid_map
-
-        r = requests.get(self.published_url, timeout=30)
-        r.raise_for_status()
-        html = r.text
-
-        found: Dict[str, str] = {}
-
-        # Published Sheets commonly embeds tab definitions in JS.
-        patterns = [
-            r'"gid":"(\d+)".{0,1000}?"name":"([^"]+)"',
-            r'"name":"([^"]+)".{0,1000}?"gid":"(\d+)"',
-            r'gid=(\d+)[^<]{0,500}>([^<]{1,120})<',
-            r'>([^<]{1,120})</a>[^<]{0,250}gid=(\d+)',
-        ]
-
-        for pattern in patterns:
-            for m in re.finditer(pattern, html, re.I | re.S):
-                a, b = m.groups()
-                if a.isdigit():
-                    gid, name = a, b
-                else:
-                    name, gid = a, b
-                name = re.sub(r"<[^>]+>", "", name)
-                name = re.sub(r"\s+", " ", name).strip()
-                if name and gid.isdigit():
-                    found[name] = gid
-
-        if not found:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            snippet = response.text[:300].replace("\n", " ")
             raise RuntimeError(
-                "Could not discover published Google Sheet tabs. "
-                "Set GOZAAYAN_GID_MAP in the deployment secrets."
+                f"Apps Script returned non-JSON for '{name}': {snippet}"
+            ) from exc
+
+        if not payload.get("ok"):
+            raise RuntimeError(
+                payload.get("error") or
+                f"Apps Script failed for sheet '{name}'."
             )
 
-        self._gid_map = found
-        return found
+        raw_rows = payload.get("rows") or []
+        if not raw_rows:
+            return pd.DataFrame()
+
+        # Drop the workbook's first/header row, matching the XLSX adapter.
+        return normalise(pd.DataFrame(raw_rows[1:]))
+
+    def _fetch(self, name: str) -> pd.DataFrame:
+        """
+        Apps Script answers /exec with a 302 to a single-use
+        script.googleusercontent.com URL. Under concurrent load Google
+        sometimes invalidates that content key before we follow the
+        redirect, producing a transient 404 on the second hop. Retrying
+        gets a fresh redirect and almost always succeeds.
+        """
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                return self._fetch_once(name)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < FETCH_ATTEMPTS - 1:
+                    time.sleep(FETCH_BACKOFF_SECONDS * (attempt + 1))
+
+        raise RuntimeError(f"{name}: {last_exc}")
 
     def sheet(self, name: str) -> pd.DataFrame:
-        if name in self._cache:
-            return self._cache[name].copy()
+        if name not in self._cache:
+            self._cache[name] = self._fetch(name)
+        return self._cache[name].copy()
 
-        gids = self._discover_gids()
-        if name not in gids:
-            raise KeyError(
-                f"Published tab '{name}' was not found. "
-                f"Available: {sorted(gids)}"
+    def _fetch_batch(self, names) -> dict:
+        """
+        Single request for many tabs. Requires the Apps Script to be
+        redeployed with the ?sheets= handler (see AppsScript_Code.gs).
+        One redirect hop instead of N removes the transient-404 failure
+        mode entirely.
+        """
+        response = requests.get(
+            self.api_url,
+            params={"sheets": ",".join(names)},
+            timeout=120,
+            allow_redirects=True,
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            snippet = response.text[:300].replace("\n", " ")
+            raise RuntimeError(
+                f"Apps Script returned non-JSON for batch: {snippet}"
+            ) from exc
+
+        if not payload.get("ok"):
+            raise RuntimeError(
+                payload.get("error") or "Apps Script batch request failed."
             )
 
-        gid = gids[name]
-        pub_base = self.published_url.split("/pubhtml")[0] + "/pub"
-        url = f"{pub_base}?gid={gid}&single=true&output=csv"
+        return payload
 
-        r = requests.get(url, timeout=45)
-        r.raise_for_status()
+    def warm(self, names) -> list:
+        """
+        Pre-fetch tabs. Returns a list of error strings rather than raising:
+        a tab that fails here is still fetched lazily by sheet() on first
+        use, so a partial warm must not discard the tabs that did succeed.
+        """
+        names = [n for n in names if n not in self._cache]
+        if not names:
+            return []
 
-        df = pd.read_csv(io.BytesIO(r.content))
-        df = normalise(df)
-        self._cache[name] = df
-        return df.copy()
+        errors = []
+
+        if BATCH_FETCH:
+            try:
+                payload = self._fetch_batch(names)
+                sheets = payload.get("sheets") or {}
+                for name in names:
+                    raw_rows = sheets.get(name)
+                    if raw_rows is None:
+                        errors.append(
+                            f"{name}: missing from batch response"
+                        )
+                        continue
+                    self._cache[name] = (
+                        normalise(pd.DataFrame(raw_rows[1:]))
+                        if raw_rows else pd.DataFrame()
+                    )
+                for name, msg in (payload.get("errors") or {}).items():
+                    errors.append(f"{name}: {msg}")
+                return errors
+            except Exception as exc:
+                # Batch endpoint not deployed yet, or failed. Fall through
+                # to per-tab fetching rather than taking the app down.
+                errors.append(f"batch fetch fell back to per-tab: {exc}")
+
+        workers = min(WARM_WORKERS, len(names))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self._fetch, name): name for name in names}
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    self._cache[name] = future.result()
+                except Exception as exc:
+                    errors.append(str(exc))
+
+        return errors
+
+    @property
+    def cached_tabs(self) -> int:
+        return len(self._cache)
 
 
 class SourceManager:
@@ -342,27 +423,55 @@ class SourceManager:
         self.source_name = "UNINITIALIZED"
         self.last_refresh: Optional[datetime] = None
         self.last_error: Optional[str] = None
+        self.degraded: bool = False
         self.refresh()
 
     def refresh(self):
         with self.lock:
             if LIVE_REQUIRED:
                 try:
-                    live = PublishedSource(PUBLISHED_URL)
-                    for tab in self.REQUIRED_TABS:
-                        live.sheet(tab)
+                    live = AppsScriptSource(APPS_SCRIPT_URL)
+                    errors = live.warm(self.REQUIRED_TABS)
+
+                    if live.cached_tabs == 0:
+                        # Nothing came back at all — treat as a hard failure.
+                        raise RuntimeError(
+                            "Live Sheet refresh failed — " + " | ".join(errors)
+                        )
+
+                    # Partial warm is acceptable: sheet() lazily fetches any
+                    # tab that missed, so we keep the tabs we did get.
                     self.source = live
-                    self.source_name = "LIVE GOOGLE SHEET"
-                    self.last_error = None
-                    self.last_refresh = datetime.now()
+                    self.last_refresh = datetime.now(BDT)
+
+                    if errors:
+                        self.degraded = True
+                        self.source_name = "LIVE GOOGLE SHEET (PARTIAL)"
+                        self.last_error = (
+                            f"{len(errors)} tab(s) missed this refresh, will "
+                            "load on demand — " + " | ".join(errors)
+                        )
+                    else:
+                        self.degraded = False
+                        self.source_name = "LIVE GOOGLE SHEET"
+                        self.last_error = None
                     return
+
                 except Exception as exc:
-                    # In live mode, do NOT fall back to snapshots.
-                    # A public dashboard must never silently show stale data.
-                    self.source = None
-                    self.source_name = "LIVE GOOGLE SHEET UNAVAILABLE"
+                    # In live mode, do NOT fall back to bundled snapshots.
+                    # But DO keep serving the last good live data if we have
+                    # it — stale numbers with a visible warning beat a dead
+                    # dashboard in front of a manager.
                     self.last_error = str(exc)
-                    self.last_refresh = None
+                    self.degraded = True
+
+                    if self.source is not None:
+                        self.source_name = "LIVE GOOGLE SHEET (STALE)"
+                        # last_refresh intentionally left at its old value so
+                        # the UI can show how old the data actually is.
+                    else:
+                        self.source_name = "LIVE GOOGLE SHEET UNAVAILABLE"
+                        self.last_refresh = None
                     return
 
             if not SNAPSHOT_DASH.exists() or not SNAPSHOT_CSS.exists():
@@ -376,10 +485,18 @@ class SourceManager:
             )
             self.source_name = "BUNDLED SNAPSHOT (LOCAL TEST MODE)"
             self.last_error = None
-            self.last_refresh = datetime.now()
+            self.last_refresh = datetime.now(BDT)
 
     def tab(self, name: str) -> pd.DataFrame:
         with self.lock:
+            if self.source is None:
+                # Surface the real reason as JSON. Previously this raised
+                # AttributeError, which FastAPI returned as a plain-text
+                # 500 that the frontend then tried to JSON.parse().
+                raise HTTPException(
+                    status_code=503,
+                    detail=self.last_error or "Live source unavailable.",
+                )
             if isinstance(self.source, SnapshotSource):
                 return self.source.dash(name)
             return self.source.sheet(name)
@@ -1318,12 +1435,17 @@ async def lifespan(app: FastAPI):
 
 
 async def auto_refresh_loop():
+    # Sleep FIRST: SourceManager.__init__ already refreshed at import time.
+    # Refreshing again here delayed the port bind by ~2 minutes on boot.
     while True:
+        await asyncio.sleep(REFRESH_MINUTES * 60)
         try:
-            SOURCE.refresh()
+            # SOURCE.refresh() is blocking requests I/O. Running it directly
+            # in the event loop stalls uvicorn, including startup and every
+            # in-flight request.
+            await asyncio.to_thread(SOURCE.refresh)
         except Exception as exc:
             SOURCE.last_error = str(exc)
-        await asyncio.sleep(REFRESH_MINUTES * 60)
 
 
 async def month_end_snapshot_loop():
@@ -1332,7 +1454,7 @@ async def month_end_snapshot_loop():
     # the 30-minute data-refresh cadence.
     while True:
         try:
-            maybe_month_end_snapshot()
+            await asyncio.to_thread(maybe_month_end_snapshot)
         except Exception as exc:
             SOURCE.last_error = f"Month-end snapshot check failed: {exc}"
         await asyncio.sleep(60)
@@ -1360,6 +1482,7 @@ def health():
     live_ok = SOURCE.source is not None
     return {
         "ok": live_ok,
+        "degraded": SOURCE.degraded,
         "source": SOURCE.source_name,
         "live_required": LIVE_REQUIRED,
         "last_refresh": SOURCE.last_refresh.isoformat()
@@ -1367,6 +1490,7 @@ def health():
         "last_error": SOURCE.last_error,
         "refresh_minutes": REFRESH_MINUTES,
         "currency": "USD",
+        "source_api": bool(APPS_SCRIPT_URL),
     }
 
 
@@ -1391,6 +1515,18 @@ def refresh():
             time.perf_counter() - started,
             2
         ),
+    }
+
+
+@app.get("/api/source")
+def api_source():
+    return {
+        "source": SOURCE.source_name,
+        "degraded": SOURCE.degraded,
+        "live_required": LIVE_REQUIRED,
+        "apps_script_url_configured": bool(APPS_SCRIPT_URL),
+        "last_refresh": SOURCE.last_refresh.isoformat() if SOURCE.last_refresh else None,
+        "last_error": SOURCE.last_error,
     }
 
 
@@ -1463,6 +1599,16 @@ def api_branch(
         end_d,
     )
 
+    # Product achievement bars are locked to the current Bangladesh calendar month
+    # and therefore do not move when the report date filter changes.
+    today_bdt = datetime.now(BDT).date()
+    locked_month_start = month_start(today_bdt)
+    locked_month_progress = branch_period(
+        canonical,
+        locked_month_start,
+        today_bdt,
+    )
+
     return {
         "page": "branch",
         "branch": canonical,
@@ -1482,6 +1628,11 @@ def api_branch(
             "pipeline_worth": progress["pipeline_worth"],
             "footfall": data["footfall"],
             "targets": progress["targets"],
+        },
+        "locked_month_progress": {
+            "month": today_bdt.strftime("%Y-%m"),
+            "products": locked_month_progress["products"],
+            "targets": locked_month_progress["targets"],
         },
         "source": SOURCE.source_name,
         "last_refresh": SOURCE.last_refresh.isoformat()

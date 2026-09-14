@@ -43,6 +43,7 @@ SNAPSHOT_CSS = DATA_DIR / "CSS Helper (1).xlsx"
 
 APPS_SCRIPT_URL = os.getenv("GOZAAYAN_SHEETS_API_URL", "https://script.google.com/macros/s/AKfycbxzvfVm3zjo8ADZBCxE7jcSnKIaISEmRzbsIfWiIAUsiHHTDnLU6uhsYlhrfYMjVYLT/exec").strip()
 LIVE_REQUIRED = bool(APPS_SCRIPT_URL)
+BDT = ZoneInfo("Asia/Dhaka")
 
 REFRESH_MINUTES = int(os.getenv("GOZAAYAN_REFRESH_MINUTES", "30"))
 SNAPSHOT_HOUR = int(os.getenv("GOZAAYAN_SNAPSHOT_HOUR", "23"))
@@ -337,7 +338,7 @@ class SourceManager:
                     self.source = live
                     self.source_name = "LIVE GOOGLE SHEET"
                     self.last_error = None
-                    self.last_refresh = datetime.now()
+                    self.last_refresh = datetime.now(BDT)
                     return
                 except Exception as exc:
                     # In live mode, do NOT fall back to snapshots.
@@ -358,7 +359,7 @@ class SourceManager:
             )
             self.source_name = "BUNDLED SNAPSHOT (LOCAL TEST MODE)"
             self.last_error = None
-            self.last_refresh = datetime.now()
+            self.last_refresh = datetime.now(BDT)
 
     def tab(self, name: str) -> pd.DataFrame:
         with self.lock:
@@ -1457,6 +1458,16 @@ def api_branch(
         end_d,
     )
 
+    # Product achievement bars are locked to the current Bangladesh calendar month
+    # and therefore do not move when the report date filter changes.
+    today_bdt = datetime.now(BDT).date()
+    locked_month_start = month_start(today_bdt)
+    locked_month_progress = branch_period(
+        canonical,
+        locked_month_start,
+        today_bdt,
+    )
+
     return {
         "page": "branch",
         "branch": canonical,
@@ -1476,6 +1487,11 @@ def api_branch(
             "pipeline_worth": progress["pipeline_worth"],
             "footfall": data["footfall"],
             "targets": progress["targets"],
+        },
+        "locked_month_progress": {
+            "month": today_bdt.strftime("%Y-%m"),
+            "products": locked_month_progress["products"],
+            "targets": locked_month_progress["targets"],
         },
         "source": SOURCE.source_name,
         "last_refresh": SOURCE.last_refresh.isoformat()

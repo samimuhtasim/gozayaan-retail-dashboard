@@ -14,7 +14,7 @@ function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&l
 function usd(v){if(v===null||v===undefined||v==="")return"N/A";const n=Number(v);return Number.isFinite(n)?"$"+n.toLocaleString("en-US",{maximumFractionDigits:2}):"N/A"}
 function n(v){const x=Number(v);return Number.isFinite(x)?x:0}
 function pct(v){if(v===null||v===undefined||!Number.isFinite(Number(v)))return"N/A";return(Number(v)*100).toFixed(1)+"%"}
-function today(){return new Date().toISOString().slice(0,10)}
+function today(){return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Dhaka"}).format(new Date())}
 
 function readUrl(){
  const q=new URLSearchParams(location.search);
@@ -113,7 +113,7 @@ async function load(){
    else d=await api(`/api/branch/${state.page}?start=${encodeURIComponent(state.start||today())}&end=${encodeURIComponent(state.end||today())}`);
    state.lastRefresh=d.last_refresh||null;
    render(d);
-   setStatus((d.source||"Source")+" • last data refresh "+(state.lastRefresh?new Date(state.lastRefresh).toLocaleString("en-GB",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}):"unknown"));
+   setStatus((d.source||"Source")+" • last data refresh "+(state.lastRefresh?new Date(state.lastRefresh).toLocaleString("en-GB",{timeZone:"Asia/Dhaka",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit",hour12:false})+" BDT":"unknown"));
  }catch(err){
    root.innerHTML=`<div class="error"><b>Live data unavailable.</b><br>${esc(err.message||err)}<br><br>The dashboard is not showing a snapshot because live mode is enabled.</div>`;
    setStatus("LIVE SOURCE UNAVAILABLE","error");
@@ -194,8 +194,8 @@ function renderBranch(d){
  <table class="table"><thead><tr><th>Product</th><th>CSS GMV</th><th>Retail GMV</th><th>Total GMV</th><th>Receivable</th><th>Bookings</th></tr></thead><tbody>
  ${products.map(([name,x])=>`<tr><td>${name}</td><td>${usd(x.css)}</td><td>${usd(x.retail)}</td><td><b>${usd(x.gmv)}</b></td><td>${usd(x.receivable)}</td><td>${n(x.bookings)}</td></tr>`).join("")}
  </tbody></table></div>
- <div class="card"><div class="section-title">Target Achievement</div>
- ${products.map(([name,x])=>{const t=d.progress.targets[name]||0;const a=t?x.gmv/t:null;return `<div class="mini"><span>${name}</span><b>${pct(a)}</b></div><div class="bar"><i style="width:${Math.min(100,(a||0)*100)}%"></i></div><div class="small" style="margin:4px 0 10px">${usd(x.gmv)} / ${usd(t)}</div>`}).join("")}
+ <div class="card"><div class="section-title">Target Achievement <span class="small">• ${esc(d.locked_month_progress?.month||"")}</span></div>
+ ${Object.entries(d.locked_month_progress?.products||{}).filter(([name])=>["Flight","Hotel","Tour","Visa"].includes(name)).map(([name,x])=>{const t=(d.locked_month_progress.targets||{})[name]||0;const a=t?x.gmv/t:null;return `<div class="mini"><span>${name}</span><b>${pct(a)}</b></div><div class="bar"><i style="width:${Math.min(100,(a||0)*100)}%"></i></div><div class="small" style="margin:4px 0 10px">${usd(x.gmv)} / ${usd(t)}</div>`}).join("")}
  </div></div>
  <div class="grid3 section">
  <div class="card"><div class="section-title">Run Rate</div><div class="mini"><span>Required Run Rate</span><b>${usd(d.progress.required_run_rate)}</b></div><div class="mini"><span>Gap to Required</span><b class="${d.progress.gap>=0?"good":"bad"}">${usd(d.progress.gap)}</b></div></div>
@@ -239,6 +239,15 @@ function narrative(title,rows){
  const text=rows.flat().filter(x=>String(x||"").trim()).join("\n");
  return `<div class="section"><div class="card"><div class="section-title">${title}</div><div class="narrative">${esc(text)}</div></div></div>`;
 }
+
+const sidebarToggle=document.getElementById("sidebarToggle");
+sidebarToggle.addEventListener("click",()=>{
+ document.body.classList.toggle("sidebar-hidden");
+ const hidden=document.body.classList.contains("sidebar-hidden");
+ sidebarToggle.textContent=hidden?"☰":"×";
+ sidebarToggle.setAttribute("aria-label",hidden?"Show navigation":"Hide navigation");
+ sidebarToggle.title=hidden?"Show navigation":"Hide navigation";
+});
 
 document.querySelectorAll("#nav button").forEach(b=>b.addEventListener("click",()=>setPage(b.dataset.page)));
 
